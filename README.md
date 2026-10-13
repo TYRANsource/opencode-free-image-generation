@@ -14,7 +14,8 @@ With the OpenCode CLI:
 opencode plugin add github:TYRANsource/opencode-duckai-image-generation
 ```
 
-Without the CLI — clone into the auto-loaded plugins folder:
+Without the CLI — clone into the auto-loaded plugins folder
+(commands below are for PowerShell; in `cmd` replace `~` with `%USERPROFILE%`):
 
 ```sh
 # per-project:
