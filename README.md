@@ -9,11 +9,27 @@ OpenCode plugin: **`/gen` command**, **`gen`** and **`duck_setup`** tools — ar
 
 ## Install
 
+With the OpenCode CLI:
+
 ```sh
 opencode plugin add github:TYRANsource/opencode-duckai-image-generation
 ```
 
 Restart OpenCode (config-declared packages load at startup).
+
+Without the CLI (manual install, no `opencode` command needed) —
+clone it into the auto-loaded plugins folder:
+
+```sh
+# per-project:
+git clone https://github.com/TYRANsource/opencode-duckai-image-generation.git .opencode/plugins/opencode-duckai-image-generation
+
+# ...or global (all projects):
+git clone https://github.com/TYRANsource/opencode-duckai-image-generation.git ~/.config/opencode/plugins/opencode-duckai-image-generation
+```
+
+Then restart OpenCode. Note: the desktop `OpenCode.exe` is not the CLI —
+a path to it can't replace `opencode` in the install command.
 
 ## Usage
 
