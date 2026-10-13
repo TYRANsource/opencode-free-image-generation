@@ -5,23 +5,6 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { basename, extname, isAbsolute, join, resolve } from "node:path"
 import { homedir, tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
-import { type ExitServer } from "./vpn-links.js"
-import {
-  buildPoolFromExits,
-  detectHapp,
-  mergeRelayEnv,
-  parseLinkPool,
-  pidOnPort,
-  readPoolProxies,
-  readRelayEnvProxies,
-  rememberPool,
-  removeRelayEnvProxies,
-  vpnLog,
-  type BuildOptions,
-} from "./vpn.js"
-import { fetchSubscription } from "./vpn-sub.js"
-import { loadSecrets, saveSecrets, vpnDir } from "./vpn-store.js"
-import { portBusy, probeExit, stopSidecar, describeExits } from "./vpn-xray.js"
 
 /**
  * opencode-duck-art — `gen` tool + `/gen` command that produce artwork through
@@ -84,22 +67,8 @@ export interface DuckArtOptions {
   show?: boolean
   /** Register the /gen command. Default true. */
   command?: boolean
-  /** VPN pool for the relay (own xray sidecar, happ-compatible). */
-  vpn?: VpnSettings
-  /** Register the /duck-vpn command. Default true. */
-  vpnCommand?: boolean
   /** Log resolved settings to the OpenCode log on load. Default false. */
   debug?: boolean
-}
-
-/** Settings for the `duck_vpn` pool. Env overrides in parentheses. */
-export interface VpnSettings {
-  /** How many exits to keep in the pool. Default 4, clamped 1..8. (DUCK_VPN_POOL_SIZE) */
-  poolSize?: number
-  /** First local SOCKS port for the sidecar inbounds. Default 11808. (DUCK_VPN_BASE_PORT) */
-  basePort?: number
-  /** xray binary. Default: happ-desktop's bundled core on Windows, else PATH. (DUCK_VPN_XRAY) */
-  xrayPath?: string
 }
 
 /** Generic fallbacks so the plugin is useful before any preset is configured. */
@@ -447,14 +416,6 @@ export default Plugin.define({
     function startRelay(dir: string = RELAY_DIR): Promise<boolean> {
       if (starting) return starting
       starting = (async () => {
-        // Stored VPN pool (if any): the relay reads DUCKAI_PROXIES at import,
-        // so it must arrive through the environment, not just the `.env` file.
-        let pool: string[] = []
-        try {
-          pool = await readPoolProxies()
-        } catch {
-          pool = []
-        }
         try {
           const child = spawn(
             venvPython(dir),
@@ -471,7 +432,6 @@ export default Plugin.define({
                 DUCKAI_MODEL: DEFAULT_MODEL,
                 DUCKAI_NEW_CHAT: "1",
                 PYTHONIOENCODING: "utf-8",
-                ...(pool.length ? { DUCKAI_PROXIES: pool.join(",") } : {}),
               },
             },
           )
@@ -498,46 +458,6 @@ export default Plugin.define({
       if (!AUTO_START) return `relay not reachable at ${RELAY_URL}`
       if (!(await startRelay(dir))) return `relay failed to start (expected it at ${RELAY_URL}, dir ${dir})`
       return null
-    }
-
-    /**
-     * Restart the relay so a changed `.env` (e.g. a new DUCKAI_PROXIES pool)
-     * takes effect. Only kills the listener when it really is our relay
-     * (relayReady verifies the DuckAI2API model catalog first).
-     */
-    async function restartRelay(dir: string = RELAY_DIR): Promise<boolean> {
-      if (await relayReady()) {
-        const port = Number(RELAY_PORT)
-        if (Number.isInteger(port)) {
-          const pid = await pidOnPort(port)
-          if (pid !== null && pid > 0) {
-            try {
-              if (process.platform === "win32") {
-                await runStep("taskkill", ["/PID", String(pid), "/F"], { timeoutMs: 15_000 })
-              } else {
-                process.kill(pid, "SIGTERM")
-              }
-            } catch {
-              // The old instance may already be gone; starting covers it.
-            }
-            await new Promise((r) => setTimeout(r, 1000))
-          }
-        }
-      }
-      return startRelay(dir)
-    }
-
-    /** Resolve VPN pool settings against per-call settings (same no-cache rule). */
-    const vpnOptsOf = (settings: DuckArtOptions): Required<Omit<VpnSettings, "xrayPath">> & { xrayPath?: string } => {
-      const vpn = settings.vpn ?? {}
-      const poolSize = Math.min(Math.max(Math.trunc(Number(vpn.poolSize ?? process.env.DUCK_VPN_POOL_SIZE ?? 4)) || 4, 1), 8)
-      const basePort =
-        Math.trunc(Number(vpn.basePort ?? process.env.DUCK_VPN_BASE_PORT ?? 11808)) || 11808
-      return {
-        poolSize,
-        basePort,
-        xrayPath: vpn.xrayPath ?? process.env.DUCK_VPN_XRAY ?? undefined,
-      }
     }
 
     /**
@@ -636,7 +556,7 @@ export default Plugin.define({
         done.push(`installed Chromium (${CHROME_PATH})`)
       }
 
-      // 6. Config. Only written when absent - never clobber someone's proxy pool or API key.
+      // 6. Config. Only written when absent - never clobber an existing config.
       const envFile = join(relayDir, ".env")
       if (!(await pathExists(envFile))) {
         await writeFile(
@@ -884,19 +804,6 @@ export default Plugin.define({
             const upstream = /ERR_[A-Z_]+|CAPTCHA|relay rejected|relay returned|fetch failed|HTTP \d{3}/.test(
               message,
             )
-            let vpnHint = ""
-            if (upstream) {
-              try {
-                const pool = await readPoolProxies()
-                vpnHint = pool.length
-                  ? `\nVPN pool active (${pool.length} exit(s), rotation on ban is automatic). ` +
-                    `If every exit is banned, run the \`duck_vpn\` tool (test / refresh).`
-                  : `\nNo VPN pool configured. If duck.ai is blocked here or bans this IP, run the ` +
-                    `\`duck_vpn\` tool — \`/duck-vpn\` walks through setup (paste the subscription URL once).`
-              } catch {
-                vpnHint = ""
-              }
-            }
             return {
               content: [
                 {
@@ -906,8 +813,7 @@ export default Plugin.define({
                     (upstream
                       ? `Duck.ai rate-limits with ERR_BN_LIMIT and can serve a visual CAPTCHA (ERR_CHALLENGE); ` +
                         `retrying after a pause usually clears it.`
-                      : "") +
-                    vpnHint,
+                      : ""),
                 },
               ],
             }
@@ -978,324 +884,6 @@ export default Plugin.define({
         },
       })
     })
-
-    await ctx.tool.transform((editor) => {
-      editor.add({
-        name: "duck_vpn",
-        description:
-          "Own VPN pool for the Duck.ai relay (happ-compatible, no system VPN changes). " +
-          "Actions: status | setup-subscription | build-pool | test | switch-exit | refresh | off. " +
-          "Builds a local xray sidecar (one SOCKS inbound per exit, happ app untouched) and points the relay at it, " +
-          "so ban/limit on one exit auto-rotates to the next. Secrets stay in the user-data dir, never in the repo.",
-        input: {
-          type: "object",
-          properties: {
-            action: {
-              type: "string",
-              description:
-                "status: show pool/sidecar/relay state. setup-subscription: build from a happ subscription URL " +
-                "(pass `url`; without it returns the ask-the-user text). build-pool: rebuild from the stored " +
-                "servers. test: probe every exit. switch-exit: prefer exit `index` (1-based). refresh: re-fetch " +
-                "the subscription and rebuild. off: stop the sidecar, relay goes direct again.",
-            },
-            url: { type: "string", description: "happ subscription URL (setup-subscription only)." },
-            index: {
-              type: "integer",
-              description: "1-based exit number (switch-exit only).",
-              minimum: 1,
-            },
-          },
-          additionalProperties: false,
-        },
-        execute: async (raw, context) => {
-          const input = raw as {
-            action?: string
-            url?: string
-            index?: number
-          }
-          const progress = async (status: string) => {
-            await context.progress({ status })
-          }
-          const fail = (text: string) => ({ content: [{ type: "text" as const, text }] })
-          const action = (input.action ?? "status").trim() || "status"
-
-          try {
-            const settings = await loadSettings()
-            const vpnOpts = vpnOptsOf(settings)
-            const relayDir = relayDirOf(settings)
-            const dir = vpnDir()
-            const buildOpts: BuildOptions = {
-              poolSize: vpnOpts.poolSize,
-              basePort: vpnOpts.basePort,
-              xrayPath: vpnOpts.xrayPath,
-              dir,
-              progress,
-            }
-
-            /** Build sidecar + wire relay, shared by every setup path. */
-            const buildFlow = async (
-              exits: ExitServer[],
-              skipped: string[],
-              mode: "subscription" | "links",
-              subUrl: string | undefined,
-              linksToStore: string[],
-            ): Promise<string> => {
-              if (context.signal.aborted) throw new Error("cancelled")
-              const built = await buildPoolFromExits(exits, buildOpts)
-              const allSkipped = [...skipped, ...built.skipped]
-              await rememberPool(mode, linksToStore.slice(0, linksToStore.length), built.exits, built.ports, subUrl, dir)
-              await mergeRelayEnv(relayDir, built.proxies)
-              await vpnLog(`pool built (${mode}): ${built.exits.length} exits`, dir)
-              if (context.signal.aborted) throw new Error("cancelled")
-              const restarted = await restartRelay(relayDir)
-              const lines = [
-                `VPN pool ready: ${built.exits.length} exit(s), relay ${restarted ? "restarted with the pool" : "restart FAILED — rerun the action"}.`,
-                ...describeExits(built.exits, built.ports).map(
-                  (d, i) => `  ${d} — probe ${built.probeMs[i] === -1 ? "FAILED" : `${built.probeMs[i]}ms`}`,
-                ),
-              ]
-              if (allSkipped.length) {
-                lines.push(`Skipped ${allSkipped.length} server(s):`)
-                for (const s of allSkipped.slice(0, 5)) lines.push(`  - ${s}`)
-              }
-              lines.push("Ban/limit on one exit now auto-rotates to the next inside the same `gen` call.")
-              return lines.join("\n")
-            }
-
-            /** Summarize a fetched subscription (either shape) for progress. */
-            const describeSub = (
-              sub: { links: string[]; entries: { tag: string }[]; skipped: string[]; isJson: boolean; title: string | null; userinfo: string | null },
-            ): string => {
-              const count = sub.isJson ? sub.entries.length : sub.links.length
-              return (
-                `subscription OK: ${count} server(s)` +
-                (sub.title ? ` (${sub.title})` : "") +
-                (sub.userinfo ? ` [${sub.userinfo}]` : "") +
-                (sub.skipped.length ? `, skipped ${sub.skipped.length}` : "")
-              )
-            }
-
-            if (action === "status") {
-              const secrets = await loadSecrets(dir)
-              const happ = await detectHapp()
-              const envProxies = await readRelayEnvProxies(relayDir)
-              const relayUp = await relayReady()
-              const alivePorts: number[] = []
-              for (const p of secrets.ports) {
-                if (await portBusy(p)) alivePorts.push(p)
-              }
-              const lines = [
-                `mode: ${secrets.mode ?? "not configured"}` +
-                  (secrets.updatedAt ? ` (updated ${secrets.updatedAt.slice(0, 16).replace("T", " ")})` : ""),
-                `sidecar: ${alivePorts.length}/${secrets.ports.length} inbound(s) answering` +
-                  (alivePorts.length ? ` (${alivePorts.join(", ")})` : ""),
-                `relay ${RELAY_URL}: ${relayUp ? "up" : "down"}, .env pool: ${envProxies.length} exit(s)`,
-                `happ app local inbound: ${happ.inbound ? `yes (${happ.ports.join(", ")})` : "no"}`,
-              ]
-              if (secrets.exits.length && secrets.ports.length) {
-                lines.push("exits:")
-                for (const d of describeExits(
-                  secrets.exits.slice(0, secrets.ports.length).map((e) => ({
-                    tag: e.tag,
-                    protocol: e.protocol as ExitServer["protocol"],
-                    host: e.host,
-                    port: e.port,
-                    link: "",
-                    outbound: e.outbound,
-                  })),
-                  secrets.ports,
-                )) {
-                  lines.push(`  ${d}`)
-                }
-              } else if (secrets.exits.length || secrets.links.length) {
-                lines.push("servers stored but pool not built — run build-pool.");
-              } else {
-                lines.push("no servers stored — run setup-subscription.");
-              }
-              return fail(lines.join("\n"))
-            }
-
-            if (action === "setup-subscription") {
-              const url = (input.url ?? "").trim()
-              if (!url) {
-                return fail(
-                  "ASK_USER: need the happ subscription URL (paste once, it is stored in the local user-data dir, never in the repo).",
-                )
-              }
-              const secrets = await loadSecrets(dir)
-              await progress("fetching the subscription...")
-              const sub = await fetchSubscription(url, secrets.hwid)
-              await progress(describeSub(sub))
-              if (sub.isJson) {
-                if (!sub.entries.length) {
-                  return fail(
-                    "no usable exits in this subscription." +
-                      (sub.skipped.length ? `\n- ${sub.skipped.slice(0, 8).join("\n- ")}` : ""),
-                  )
-                }
-                const exits: ExitServer[] = sub.entries.slice(0, vpnOpts.poolSize).map((e) => ({
-                  tag: e.tag,
-                  protocol: e.protocol as ExitServer["protocol"],
-                  host: e.host,
-                  port: e.port,
-                  link: "",
-                  outbound: e.outbound,
-                }))
-                return fail(await buildFlow(exits, sub.skipped, "subscription", url, []))
-              }
-              const { exits, skipped } = parseLinkPool(sub.links, vpnOpts.poolSize)
-              if (!exits.length) {
-                return fail("no usable exits in this subscription." + (skipped.length ? `\n- ${skipped.slice(0, 8).join("\n- ")}` : ""))
-              }
-              return fail(await buildFlow(exits, skipped, "subscription", url, sub.links))
-            }
-
-            if (action === "build-pool") {
-              const secrets = await loadSecrets(dir)
-              if (!secrets.exits.length) {
-                return fail("no stored servers: run setup-subscription first.")
-              }
-              const exits: ExitServer[] = secrets.exits.slice(0, vpnOpts.poolSize).map((e) => ({
-                tag: e.tag,
-                protocol: e.protocol as ExitServer["protocol"],
-                host: e.host,
-                port: e.port,
-                link: "",
-                outbound: e.outbound,
-              }))
-              return fail(await buildFlow(exits, [], secrets.mode ?? "links", secrets.subUrl, secrets.links))
-            }
-
-            if (action === "test") {
-              const secrets = await loadSecrets(dir)
-              if (!secrets.exits.length || !secrets.ports.length) {
-                return fail("pool not built — run setup-subscription first.")
-              }
-              const lines: string[] = []
-              const count = Math.min(secrets.exits.length, secrets.ports.length)
-              for (let i = 0; i < count; i++) {
-                const tag = secrets.exits[i].tag
-                const up = await portBusy(secrets.ports[i])
-                if (!up) {
-                  lines.push(`${i + 1}. ${tag}: inbound down`)
-                  continue
-                }
-                try {
-                  const ms = await probeExit(secrets.ports[i])
-                  lines.push(`${i + 1}. ${tag}: OK (${ms}ms to duck.ai)`)
-                } catch (error) {
-                  lines.push(`${i + 1}. ${tag}: FAIL (${error instanceof Error ? error.message : String(error)})`)
-                }
-              }
-              return fail(lines.join("\n"))
-            }
-
-            if (action === "switch-exit") {
-              const secrets = await loadSecrets(dir)
-              const idx = Math.trunc(Number(input.index)) || 0
-              if (!secrets.exits.length || idx < 1 || idx > Math.min(secrets.exits.length, secrets.ports.length)) {
-                return fail("pass a valid 1-based `index` (see status for the exit list).")
-              }
-              const order = secrets.exits.map((_, i) => i)
-              order.sort((a, b) => (a === idx - 1 ? -1 : b === idx - 1 ? 1 : a - b))
-              const exits = order.map((i) => secrets.exits[i])
-              const ports = order.map((i) => secrets.ports[i])
-              await saveSecrets({ ...secrets, exits, ports }, dir)
-              await mergeRelayEnv(relayDir, ports.map((p) => `socks5://127.0.0.1:${p}`))
-              const restarted = await restartRelay(relayDir)
-              return fail(`exit ${idx} is now preferred. Relay ${restarted ? "restarted" : "restart FAILED"}.`)
-            }
-
-            if (action === "refresh") {
-              const secrets = await loadSecrets(dir)
-              if (secrets.mode !== "subscription" || !secrets.subUrl) {
-                return fail("nothing to refresh (no subscription stored — run setup-subscription).")
-              }
-              await progress("re-fetching the subscription...")
-              const sub = await fetchSubscription(secrets.subUrl, secrets.hwid)
-              await progress(describeSub(sub))
-              if (sub.isJson) {
-                if (!sub.entries.length) return fail("no usable exits in this subscription anymore.")
-                const exits: ExitServer[] = sub.entries.slice(0, vpnOpts.poolSize).map((e) => ({
-                  tag: e.tag,
-                  protocol: e.protocol as ExitServer["protocol"],
-                  host: e.host,
-                  port: e.port,
-                  link: "",
-                  outbound: e.outbound,
-                }))
-                return fail(await buildFlow(exits, sub.skipped, "subscription", secrets.subUrl, []))
-              }
-              const { exits, skipped } = parseLinkPool(sub.links, vpnOpts.poolSize)
-              if (!exits.length) return fail("no usable exits in this subscription anymore.")
-              return fail(await buildFlow(exits, skipped, "subscription", secrets.subUrl, sub.links))
-            }
-
-            if (action === "off") {
-              const stopped = await stopSidecar(dir)
-              const secrets = await loadSecrets(dir)
-              await saveSecrets({ ...secrets, ports: [] }, dir)
-              await removeRelayEnvProxies(relayDir)
-              const restarted = await restartRelay(relayDir)
-              await vpnLog("pool disabled (off)", dir)
-              return fail(
-                `VPN pool off${stopped ? " (sidecar stopped)" : ""}. Relay ${restarted ? "restarted direct" : "restart FAILED"}. Stored servers are kept — build-pool re-enables.`,
-              )
-            }
-
-            return fail(`unknown action "${action}". Use: status | setup-subscription | build-pool | test | switch-exit | refresh | off.`)
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            if (context.signal.aborted || message === "cancelled") {
-              return fail("VPN setup cancelled.")
-            }
-            try {
-              await vpnLog(`ERROR (${action}): ${message}`)
-            } catch {
-              // Logging never breaks the flow.
-            }
-            return fail(`ERROR: ${message}`)
-          }
-        },
-      })
-    })
-
-    if (options.vpnCommand !== false) {
-      await ctx.command.transform((editor) => {
-        editor.add({
-          name: "duck-vpn",
-          description: "VPN pool for the Duck.ai relay: /duck-vpn [status|off|test]",
-          execute: async ({ sessionID, prompt, delivery }) => {
-            const raw = (prompt?.text ?? "").trim().toLowerCase()
-            const action = raw.split(/\s+/)[0] || "guide"
-            if (action === "status" || action === "off" || action === "test" || action === "refresh") {
-              await ctx.session.prompt({
-                sessionID,
-                delivery,
-                text:
-                  `Run the \`duck_vpn\` tool once with action "${action}" and report the result briefly.\n\n` +
-                  `Rules:\n` +
-                  `- Do not print secrets (subscription URL, full links, passwords). Exit tags and ports are fine.\n` +
-                  `- If the result asks for a subscription URL, relay that request to the user and stop.`,
-              })
-              return
-            }
-            await ctx.session.prompt({
-              sessionID,
-              delivery,
-              text:
-                `Set up the VPN pool with the \`duck_vpn\` tool:\n\n` +
-                `1. Start with action "status" to avoid redoing a working pool.\n` +
-                `2. Call action "setup-subscription" without a url. It returns an ask-the-user text — ` +
-                `relay that to the user, wait for the URL, then call again with it.\n\n` +
-                `Rules:\n` +
-                `- Never print secrets. Never write the URL into the repo.\n` +
-                `- If the panel answers 404 (device slots full), say so and stop.`,
-            })
-          },
-        })
-      })
-    }
 
     if (options.command !== false) {
       await ctx.command.transform((editor) => {

@@ -26,20 +26,6 @@ does the same on demand (`force: true` redoes a broken install).
 Needs `git` and Python 3.11+ on `PATH`. The relay lives in
 `%LOCALAPPDATA%/opencode/duck-relay` (`~/.local/share/...` elsewhere).
 
-## VPN pool (`duck_vpn` / `/duck-vpn`)
-
-Duck.ai bans by IP. The plugin routes **only the relay's browser** through VPN
-exits (own xray sidecar, happ app and system untouched); a ban auto-rotates to
-the next exit inside the same `gen` call.
-
-Setup: paste your happ subscription URL once (`/duck-vpn` guides you). Base64
-and JSON (per-server xray configs) subscriptions work; undialable entries
-(hysteria, …) are skipped. Secrets stay in the per-user data dir, never in the
-repo. Extra actions: `status`, `test`, `switch-exit`, `refresh`, `off`.
-
-The xray binary is reused from happ-desktop when present, else `PATH` or
-`vpn.xrayPath` (`DUCK_VPN_XRAY`).
-
 ## Settings
 
 `.opencode/duck-art.json`, re-read on every call — no restart needed:
@@ -50,8 +36,7 @@ The xray binary is reused from happ-desktop when present, else `PATH` or
   "outputDir": "assets/generated",
   "presets": {
     "concept": { "size": "1536x1024", "n": 4, "dir": "assets/concepts" }
-  },
-  "vpn": { "poolSize": 4, "basePort": 11808 }
+  }
 }
 ```
 
@@ -60,7 +45,7 @@ prompt. Requested sizes are composition hints — Duck.ai may return nearby ones
 
 ## Caveats
 
-- `ERR_BN_LIMIT` / `ERR_CHALLENGE`: pause and retry (or set up the VPN pool).
+- `ERR_BN_LIMIT` / `ERR_CHALLENGE`: pause and retry.
 - ~25–45 seconds per batch.
 - Driving duck.ai through a relay may violate their ToS — a dev tool, not a pipeline.
 
