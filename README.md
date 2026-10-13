@@ -1,4 +1,4 @@
-# opencode-duck-art
+# opencode-free-image-generation
 
 Free image generation in OpenCode chat via [Duck.ai](https://duck.ai), no API key:
 
